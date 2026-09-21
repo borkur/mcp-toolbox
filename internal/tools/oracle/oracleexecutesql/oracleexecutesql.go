@@ -115,6 +115,8 @@ func (t Tool) Invoke(ctx context.Context, s sources.Source, params parameters.Pa
 		isReadOnly = *t.Cfg.ReadOnly
 	}
 
+	ctx = util.WithToolParams(ctx, paramsMap)
+
 	resp, err := source.RunSQL(ctx, sqlParam, nil, isReadOnly)
 	if err != nil {
 		return nil, util.ProcessGeneralError(err)

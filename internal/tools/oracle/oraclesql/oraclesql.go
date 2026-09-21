@@ -125,6 +125,15 @@ func (t Tool) Invoke(ctx context.Context, s sources.Source, params parameters.Pa
 		isReadOnly = *t.Cfg.ReadOnly
 	}
 
+	mergedParams := make(map[string]any)
+	for k, v := range paramsMap {
+		mergedParams[k] = v
+	}
+	for k, v := range newParams.AsMap() {
+		mergedParams[k] = v
+	}
+	ctx = util.WithToolParams(ctx, mergedParams)
+
 	resp, err := source.RunSQL(ctx, newStatement, sliceParams, isReadOnly)
 
 	if err != nil {

@@ -373,6 +373,22 @@ func UrlParamsFromContext(ctx context.Context) (map[string]string, bool) {
 	return nil, false
 }
 
+// toolParamsKey is the key used to store tool invocation parameters within context
+const toolParamsKey contextKey = "toolParams"
+
+// WithToolParams adds tool invocation parameters into the context as a value
+func WithToolParams(ctx context.Context, params map[string]any) context.Context {
+	return context.WithValue(ctx, toolParamsKey, params)
+}
+
+// ToolParamsFromContext retrieves tool invocation parameters from context
+func ToolParamsFromContext(ctx context.Context) map[string]any {
+	if params, ok := ctx.Value(toolParamsKey).(map[string]any); ok {
+		return params
+	}
+	return nil
+}
+
 // SnakeFromCamelCase converts a camelCase string to snake_case.
 func SnakeFromCamelCase(s string) string {
 	var result strings.Builder

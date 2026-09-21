@@ -170,3 +170,23 @@ func TestConvertNumbers(t *testing.T) {
 		})
 	}
 }
+
+func TestWithToolParams(t *testing.T) {
+	ctx := t.Context()
+
+	// Initially nil
+	if params := ToolParamsFromContext(ctx); params != nil {
+		t.Fatalf("expected nil params from empty context, got %v", params)
+	}
+
+	testParams := map[string]any{
+		"user_id":  "test-user-123",
+		"page_num": 5,
+	}
+
+	ctx = WithToolParams(ctx, testParams)
+	got := ToolParamsFromContext(ctx)
+	if !reflect.DeepEqual(got, testParams) {
+		t.Errorf("ToolParamsFromContext() = %v, want %v", got, testParams)
+	}
+}
