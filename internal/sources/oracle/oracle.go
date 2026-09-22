@@ -145,9 +145,16 @@ func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.So
 		return nil, fmt.Errorf("unable to connect to Oracle successfully: %w", err)
 	}
 
+func (r Config) Initialize(ctx context.Context, tracer trace.Tracer, deferConnect bool) (sources.Source, error) {
 	s := &Source{
 		Config: r,
-		DB:     db,
+		conn:   sources.NewConnectOnce[*sql.DB](ctx, r.Name, SourceType, tracer),
+	}
+	if deferConnect {
+		return s, nil
+	}
+	if _, err := s.pool(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -156,7 +163,23 @@ var _ sources.Source = &Source{}
 
 type Source struct {
 	Config
-	DB *sql.DB
+	conn *sources.ConnectOnce[*sql.DB]
+}
+
+func (s *Source) pool(ctx context.Context) (*sql.DB, error) {
+	return s.conn.Do(ctx, func(ctx context.Context) (*sql.DB, error) {
+		r := s.Config
+		db, err := initOracleConnection(ctx, r)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create Oracle connection: %w", err)
+		}
+
+		if err := db.PingContext(ctx); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("unable to connect to Oracle successfully: %w", err)
+		}
+		return db, nil
+	})
 }
 
 func (s *Source) IsReadOnly() bool {
@@ -484,6 +507,13 @@ func (s *Source) RunSQL(ctx context.Context, statement string, params []any, rea
 func executeSQL(ctx context.Context, runner sqlRunner, statement string, params []any, readOnly bool) (any, error) {
 	if !readOnly {
 		result, err := runner.ExecContext(ctx, statement, params...)
+func (s *Source) RunSQL(ctx context.Context, statement string, params []any, readOnly bool) (any, error) {
+	db, err := s.pool(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !readOnly {
+		result, err := db.ExecContext(ctx, statement, params...)
 		if err != nil {
 			return nil, fmt.Errorf("unable to execute DML statement: %w", err)
 		}
@@ -633,11 +663,7 @@ func decodePercentEncodedUserInfo(value string) string {
 	return decoded
 }
 
-func initOracleConnection(ctx context.Context, tracer trace.Tracer, config Config) (*sql.DB, error) {
-	//nolint:all // Reassigned ctx
-	ctx, span := sources.InitConnectionSpan(ctx, tracer, SourceType, config.Name)
-	defer span.End()
-
+func initOracleConnection(ctx context.Context, config Config) (*sql.DB, error) {
 	logger, err := util.LoggerFromContext(ctx)
 	if err != nil {
 		panic(err)

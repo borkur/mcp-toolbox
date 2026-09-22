@@ -357,13 +357,21 @@ func TestRunSQLExecutesDML(t *testing.T) {
 	}
 	defer db.Close()
 
+	cfg := Config{
+		Name: "test-dml-source",
+		Type: SourceType,
+		User: "test-user",
+	}
 	src := &Source{
-		Config: Config{
-			Name: "test-dml-source",
-			Type: SourceType,
-			User: "test-user",
-		},
-		DB: db,
+		Config: cfg,
+		conn:   sources.NewConnectOnce[*sql.DB](context.Background(), cfg.Name, SourceType, noop.NewTracerProvider().Tracer("test")),
+	}
+
+	// Seed the lazy connection with the mock handle so RunSQL does not dial Oracle.
+	if _, err := src.conn.Do(context.Background(), func(context.Context) (*sql.DB, error) {
+		return db, nil
+	}); err != nil {
+		t.Fatalf("failed to seed connection: %v", err)
 	}
 
 	// Invoke RunSQL with readOnly=false to force the DML execution path.
