@@ -4,6 +4,7 @@ package oracle
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -174,12 +175,69 @@ func (s *Source) OracleDB() *sql.DB {
 	return s.DB
 }
 
+type contextKey string
+
+const (
+	toolParamsKey contextKey = "oracleToolParams"
+	authClaimsKey contextKey = "oracleAuthClaims"
+)
+
+// WithToolParams adds tool invocation parameters into the context as a value.
+func WithToolParams(ctx context.Context, params map[string]any) context.Context {
+	return context.WithValue(ctx, toolParamsKey, params)
+}
+
+// ToolParamsFromContext retrieves tool invocation parameters from context.
+func ToolParamsFromContext(ctx context.Context) map[string]any {
+	if params, ok := ctx.Value(toolParamsKey).(map[string]any); ok {
+		return params
+	}
+	return nil
+}
+
+// WithAuthClaims adds auth claims into the context as a value.
+func WithAuthClaims(ctx context.Context, claims map[string]any) context.Context {
+	return context.WithValue(ctx, authClaimsKey, claims)
+}
+
+// AuthClaimsFromContext retrieves auth claims from context.
+func AuthClaimsFromContext(ctx context.Context) map[string]any {
+	if claims, ok := ctx.Value(authClaimsKey).(map[string]any); ok {
+		return claims
+	}
+	return nil
+}
+
+// ParseJWTClaims decodes the payload portion of a JWT token into a map of claims.
+// It is used to read claims from tokens that were already verified by the auth service.
+func ParseJWTClaims(token string) map[string]any {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payloadBytes, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return nil
+		}
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		return nil
+	}
+	return claims
+}
+
 func (s *Source) extractUserIdentity(ctx context.Context) (string, error) {
 	if strings.TrimSpace(s.SessionContextBlock) == "" {
 		return "", nil
 	}
 
 	claims := util.AuthTokenClaimsFromContext(ctx)
+	if len(claims) == 0 {
+		claims = AuthClaimsFromContext(ctx)
+	}
 	if len(claims) == 0 {
 		return "", nil
 	}
@@ -338,7 +396,7 @@ func (s *Source) buildSessionBlockBinds(ctx context.Context, block string, userI
 		return nil
 	}
 
-	toolParams := util.ToolParamsFromContext(ctx)
+	toolParams := ToolParamsFromContext(ctx)
 	toolParamsLower := make(map[string]any, len(toolParams))
 	for k, v := range toolParams {
 		toolParamsLower[strings.ToLower(k)] = v

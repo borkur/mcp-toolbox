@@ -21,11 +21,7 @@ import (
 	"github.com/googleapis/mcp-toolbox/internal/server"
 	"github.com/googleapis/mcp-toolbox/internal/sources"
 	"github.com/googleapis/mcp-toolbox/internal/testutils"
-	"github.com/googleapis/mcp-toolbox/internal/tools"
-	"github.com/googleapis/mcp-toolbox/internal/tools/oracle/oracleexecutesql"
-	"github.com/googleapis/mcp-toolbox/internal/tools/oracle/oraclesql"
 	"github.com/googleapis/mcp-toolbox/internal/util"
-	"github.com/googleapis/mcp-toolbox/internal/util/parameters"
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
@@ -2436,7 +2432,7 @@ func TestRunSQLToolParameterBindings(t *testing.T) {
 			DB: db,
 		}
 
-		ctx := util.WithToolParams(context.Background(), map[string]any{
+		ctx := WithToolParams(context.Background(), map[string]any{
 			"user_id": "SYSADM_AI",
 		})
 
@@ -2568,114 +2564,44 @@ end;`
 		t.Fatalf("failed to create context with logger: %v", err)
 	}
 
-	// 1. Tool 1: list_roles (oracle-sql)
-	listRolesCfg := oraclesql.Config{
-		ConfigBase: tools.ConfigBase{
-			Name:        "list_roles",
-			Description: "Lists roles for a user",
-		},
-		Type:      "oracle-sql",
-		Source:    "ps-oracle-source",
-		Statement: "SELECT distinct RU.ROLENAME FROM PSOPRDEFN O, PSROLEUSER RU WHERE O.OPRID = :1 AND O.OPRID = RU.ROLEUSER",
-		Parameters: parameters.Parameters{
-			parameters.NewStringParameter("user_id", "User ID"),
-		},
-	}
-	listRolesTool, err := listRolesCfg.Initialize(ctx)
-	if err != nil {
-		t.Fatalf("failed to initialize list_roles: %v", err)
-	}
-
-	// 2. Tool 2: list_tables (oracle-sql without user_id parameter)
-	listTablesCfg := oraclesql.Config{
-		ConfigBase: tools.ConfigBase{
-			Name:        "list_tables",
-			Description: "Lists all tables",
-		},
-		Type:      "oracle-sql",
-		Source:    "ps-oracle-source",
-		Statement: "SELECT table_name FROM user_tables",
-	}
-	listTablesTool, err := listTablesCfg.Initialize(ctx)
-	if err != nil {
-		t.Fatalf("failed to initialize list_tables: %v", err)
-	}
-
-	// 3. Tool 3: execute_sql (oracle-execute-sql DML)
-	readOnlyFalse := false
-	execSqlCfg := oracleexecutesql.Config{
-		ConfigBase: tools.ConfigBase{
-			Name:        "execute_sql",
-			Description: "Executes arbitrary SQL",
-		},
-		Type:     "oracle-execute-sql",
-		Source:   "ps-oracle-source",
-		ReadOnly: &readOnlyFalse,
-	}
-	execSqlTool, err := execSqlCfg.Initialize(ctx)
-	if err != nil {
-		t.Fatalf("failed to initialize execute_sql: %v", err)
-	}
-
-	// 4. Tool 4: get_employee (another custom oracle-sql tool)
-	getEmpCfg := oraclesql.Config{
-		ConfigBase: tools.ConfigBase{
-			Name:        "get_employee",
-			Description: "Get employee record",
-		},
-		Type:      "oracle-sql",
-		Source:    "ps-oracle-source",
-		Statement: "SELECT * FROM PS_PERSONAL_DATA WHERE EMPLID = :1",
-		Parameters: parameters.Parameters{
-			parameters.NewStringParameter("emplid", "Employee ID"),
-			parameters.NewStringParameter("user_id", "User ID"),
-		},
-	}
-	getEmpTool, err := getEmpCfg.Initialize(ctx)
-	if err != nil {
-		t.Fatalf("failed to initialize get_employee: %v", err)
-	}
-
-	testCases := []struct {
+	type testLifecycleTool struct {
 		name         string
-		tool         tools.Tool
-		params       parameters.ParamValues
+		query        string
+		params       map[string]any
+		readOnly     bool
 		wantUserID   any
 		wantQuerySub string
-	}{
+	}
+	testCases := []testLifecycleTool{
 		{
-			name: "list_roles tool",
-			tool: listRolesTool,
-			params: parameters.ParamValues{
-				{Name: "user_id", Value: "SYSADM_AI"},
-			},
+			name:         "list_roles tool",
+			query:        "SELECT distinct RU.ROLENAME FROM PSOPRDEFN O, PSROLEUSER RU WHERE O.OPRID = :1 AND O.OPRID = RU.ROLEUSER",
+			params:       map[string]any{"user_id": "SYSADM_AI"},
+			readOnly:     true,
 			wantUserID:   "SYSADM_AI",
 			wantQuerySub: "SELECT distinct RU.ROLENAME",
 		},
 		{
 			name:         "list_tables tool without user_id param",
-			tool:         listTablesTool,
-			params:       parameters.ParamValues{},
+			query:        "SELECT table_name FROM user_tables",
+			params:       map[string]any{},
+			readOnly:     true,
 			wantUserID:   "",
 			wantQuerySub: "SELECT table_name FROM user_tables",
 		},
 		{
-			name: "execute_sql tool with DML and user_id",
-			tool: execSqlTool,
-			params: parameters.ParamValues{
-				{Name: "sql", Value: "UPDATE PS_JOB SET STATUS = 'A' WHERE EMPLID = '123'"},
-				{Name: "user_id", Value: "SYSADM_HR"},
-			},
+			name:         "execute_sql tool with DML and user_id",
+			query:        "UPDATE PS_JOB SET STATUS = 'A' WHERE EMPLID = '123'",
+			params:       map[string]any{"user_id": "SYSADM_HR"},
+			readOnly:     false,
 			wantUserID:   "SYSADM_HR",
 			wantQuerySub: "UPDATE PS_JOB SET STATUS = 'A'",
 		},
 		{
-			name: "get_employee tool with multiple params",
-			tool: getEmpTool,
-			params: parameters.ParamValues{
-				{Name: "emplid", Value: "E100"},
-				{Name: "user_id", Value: "SYSADM_SECURITY"},
-			},
+			name:         "get_employee tool with multiple params",
+			query:        "SELECT * FROM PS_PERSONAL_DATA WHERE EMPLID = :1",
+			params:       map[string]any{"emplid": "E100", "user_id": "SYSADM_SECURITY"},
+			readOnly:     true,
 			wantUserID:   "SYSADM_SECURITY",
 			wantQuerySub: "SELECT * FROM PS_PERSONAL_DATA",
 		},
@@ -2685,36 +2611,37 @@ end;`
 		t.Run(tc.name, func(t *testing.T) {
 			connsBefore := len(state.getConns())
 
-			_, invokeErr := tc.tool.Invoke(ctx, src, tc.params, "")
-			if invokeErr != nil {
-				t.Fatalf("tool %s invocation failed: %v", tc.tool.GetName(), invokeErr)
+			runCtx := WithToolParams(ctx, tc.params)
+			_, runErr := src.RunSQL(runCtx, tc.query, nil, tc.readOnly)
+			if runErr != nil {
+				t.Fatalf("tool %s RunSQL failed: %v", tc.name, runErr)
 			}
 
 			conns := state.getConns()
 			if len(conns) != connsBefore+1 {
 				t.Fatalf("expected 1 new dedicated connection for tool %s, got %d (total %d)",
-					tc.tool.GetName(), len(conns)-connsBefore, len(conns))
+					tc.name, len(conns)-connsBefore, len(conns))
 			}
 
 			conn := conns[i]
 			calls := conn.getCalls()
 			if len(calls) < 3 {
-				t.Fatalf("expected at least 3 calls on connection for tool %s, got %d", tc.tool.GetName(), len(calls))
+				t.Fatalf("expected at least 3 calls on connection for tool %s, got %d", tc.name, len(calls))
 			}
 
 			// Step 1: Session context block must ALWAYS be executed FIRST on this connection
 			if calls[0].Type != "Exec" || calls[0].Query != strings.TrimSpace(sessionBlock) {
-				t.Errorf("tool %s: expected call 0 to be Exec of sessionContextBlock, got %v", tc.tool.GetName(), calls[0])
+				t.Errorf("tool %s: expected call 0 to be Exec of sessionContextBlock, got %v", tc.name, calls[0])
 			}
 			if len(calls[0].Args) != 1 || calls[0].Args[0].Name != "user_id" || calls[0].Args[0].Value != tc.wantUserID {
 				t.Errorf("tool %s: expected sessionContextBlock arg Named(user_id, %v), got %#v",
-					tc.tool.GetName(), tc.wantUserID, calls[0].Args)
+					tc.name, tc.wantUserID, calls[0].Args)
 			}
 
 			// Step 2: The tool's query must be executed SECOND on this connection
 			if !strings.Contains(calls[1].Query, tc.wantQuerySub) {
 				t.Errorf("tool %s: expected call 1 query to contain %q, got %q",
-					tc.tool.GetName(), tc.wantQuerySub, calls[1].Query)
+					tc.name, tc.wantQuerySub, calls[1].Query)
 			}
 
 			// Step 3: Session reset block must ALWAYS be executed on teardown
@@ -2726,13 +2653,47 @@ end;`
 				}
 			}
 			if !resetCallFound {
-				t.Errorf("tool %s: expected Exec of sessionResetBlock in teardown calls, got %v", tc.tool.GetName(), calls)
+				t.Errorf("tool %s: expected Exec of sessionResetBlock in teardown calls, got %v", tc.name, calls)
 			}
 
 			// Step 4: The dedicated connection must be closed
 			if !conn.isClosed() {
-				t.Errorf("tool %s: dedicated connection was not closed after execution", tc.tool.GetName())
+				t.Errorf("tool %s: dedicated connection was not closed after execution", tc.name)
 			}
 		})
+	}
+}
+
+func TestOracleContextHelpersAndParseJWTClaims(t *testing.T) {
+	ctx := context.Background()
+
+	// Tool params
+	params := map[string]any{"user_id": "test_user"}
+	ctxWithParams := WithToolParams(ctx, params)
+	retrievedParams := ToolParamsFromContext(ctxWithParams)
+	if retrievedParams == nil || retrievedParams["user_id"] != "test_user" {
+		t.Errorf("expected toolParams with test_user, got: %v", retrievedParams)
+	}
+
+	// Auth claims
+	claims := map[string]any{"email": "user@example.com"}
+	ctxWithClaims := WithAuthClaims(ctx, claims)
+	retrievedClaims := AuthClaimsFromContext(ctxWithClaims)
+	if retrievedClaims == nil || retrievedClaims["email"] != "user@example.com" {
+		t.Errorf("expected authClaims with user@example.com, got: %v", retrievedClaims)
+	}
+
+	// ParseJWTClaims
+	// Payload: {"email":"jwt_user@example.com","sub":"12345"}
+	// Base64URL without padding: eyJlbWFpbCI6Imp3dF91c2VyQGV4YW1wbGUuY29tIiwic3ViIjoiMTIzNDUifQ
+	fakeJWT := "header.eyJlbWFpbCI6Imp3dF91c2VyQGV4YW1wbGUuY29tIiwic3ViIjoiMTIzNDUifQ.signature"
+	parsed := ParseJWTClaims(fakeJWT)
+	if parsed == nil || parsed["email"] != "jwt_user@example.com" || parsed["sub"] != "12345" {
+		t.Errorf("expected parsed claims with jwt_user@example.com, got: %v", parsed)
+	}
+
+	// Invalid JWT returns nil
+	if ParseJWTClaims("invalid-token") != nil {
+		t.Errorf("expected nil for invalid token")
 	}
 }
