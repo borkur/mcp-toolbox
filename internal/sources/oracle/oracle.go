@@ -211,6 +211,10 @@ func AuthClaimsFromContext(ctx context.Context) map[string]any {
 // ParseJWTClaims decodes the payload portion of a JWT token into a map of claims.
 // It is used to read claims from tokens that were already verified by the auth service.
 func ParseJWTClaims(token string) map[string]any {
+	token = strings.TrimSpace(token)
+	if strings.HasPrefix(strings.ToLower(token), "bearer ") {
+		token = strings.TrimSpace(token[7:])
+	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return nil
