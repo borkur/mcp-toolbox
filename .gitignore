@@ -24,6 +24,5 @@ __pycache__/
 
 # executable
 mcp-toolbox
-toolbox
-toolbox.exe
+toolbox*
 **/test.db
