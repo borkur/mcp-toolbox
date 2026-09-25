@@ -231,3 +231,125 @@ func TestValidateMCPAuth_Opaque_Fallback(t *testing.T) {
 		})
 	}
 }
+
+func TestGetClaimsFromHeader_OpaqueAccessToken(t *testing.T) {
+	tests := []struct {
+		name         string
+		headerVal    string
+		clientID     string
+		tokenInfoAud string
+		tokenInfoAzp string
+		tokenEmail   string
+		statusCode   int
+		wantError    bool
+		wantEmail    string
+	}{
+		{
+			name:      "no token header",
+			headerVal: "",
+			clientID:  "my-client-id",
+			wantError: false,
+			wantEmail: "",
+		},
+		{
+			name:         "exact clientID match",
+			headerVal:    "ya29.some-opaque-token",
+			clientID:     "786365316782-930dpe.apps.googleusercontent.com",
+			tokenInfoAud: "786365316782-930dpe.apps.googleusercontent.com",
+			tokenEmail:   "borkur@pythian.com",
+			statusCode:   http.StatusOK,
+			wantError:    false,
+			wantEmail:    "borkur@pythian.com",
+		},
+		{
+			name:         "project prefix match between different client IDs",
+			headerVal:    "ya29.some-opaque-token",
+			clientID:     "786365316782-930dpe0c2hha1p81svj6t80v7n7305lu.apps.googleusercontent.com",
+			tokenInfoAud: "786365316782-schg1ho6ejng33jmnd6f472arkc0fsak.apps.googleusercontent.com",
+			tokenEmail:   "borkur@pythian.com",
+			statusCode:   http.StatusOK,
+			wantError:    false,
+			wantEmail:    "borkur@pythian.com",
+		},
+		{
+			name:         "token with Bearer prefix stripped",
+			headerVal:    "Bearer ya29.some-opaque-token",
+			clientID:     "786365316782-930dpe.apps.googleusercontent.com",
+			tokenInfoAud: "786365316782-930dpe.apps.googleusercontent.com",
+			tokenEmail:   "borkur@pythian.com",
+			statusCode:   http.StatusOK,
+			wantError:    false,
+			wantEmail:    "borkur@pythian.com",
+		},
+		{
+			name:         "audience mismatch from different project",
+			headerVal:    "ya29.some-opaque-token",
+			clientID:     "786365316782-930dpe.apps.googleusercontent.com",
+			tokenInfoAud: "999999999999-other.apps.googleusercontent.com",
+			statusCode:   http.StatusOK,
+			wantError:    true,
+		},
+		{
+			name:       "tokeninfo error response 400",
+			headerVal:  "ya29.invalid-token",
+			clientID:   "786365316782-930dpe.apps.googleusercontent.com",
+			statusCode: http.StatusBadRequest,
+			wantError:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mockClient := &http.Client{
+				Transport: mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+					if req.URL.String() != "https://oauth2.googleapis.com/tokeninfo" {
+						return nil, fmt.Errorf("unexpected URL: %s", req.URL.String())
+					}
+					status := tc.statusCode
+					if status == 0 {
+						status = http.StatusOK
+					}
+					if status != http.StatusOK {
+						return &http.Response{
+							StatusCode: status,
+							Body:       io.NopCloser(strings.NewReader(`{"error": "invalid_token"}`)),
+							Header:     make(http.Header),
+						}, nil
+					}
+					respBody := fmt.Sprintf(`{"aud": %q, "azp": %q, "email": %q, "scope": "openid email"}`, tc.tokenInfoAud, tc.tokenInfoAzp, tc.tokenEmail)
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(respBody)),
+						Header:     make(http.Header),
+					}, nil
+				}),
+			}
+
+			a := AuthService{
+				Config: Config{
+					Name:     "google-auth",
+					ClientID: tc.clientID,
+				},
+				client: mockClient,
+			}
+
+			header := make(http.Header)
+			if tc.headerVal != "" {
+				header.Set("google-auth_token", tc.headerVal)
+			}
+
+			claims, err := a.GetClaimsFromHeader(context.Background(), header)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("GetClaimsFromHeader() returned error: %v, wantError: %v", err, tc.wantError)
+			}
+			if !tc.wantError && tc.wantEmail != "" {
+				if claims == nil {
+					t.Fatalf("GetClaimsFromHeader() returned nil claims, expected email %s", tc.wantEmail)
+				}
+				if email, _ := claims["email"].(string); email != tc.wantEmail {
+					t.Fatalf("GetClaimsFromHeader() email = %q, want %q", email, tc.wantEmail)
+				}
+			}
+		})
+	}
+}

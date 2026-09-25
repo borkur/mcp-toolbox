@@ -38,6 +38,7 @@ type Config struct {
 	Name           string   `yaml:"name" validate:"required"`
 	Type           string   `yaml:"type" validate:"required"`
 	ClientID       string   `yaml:"clientId"`
+	ClientIDs      []string `yaml:"clientIds"`
 	Audience       string   `yaml:"audience"`
 	McpEnabled     bool     `yaml:"mcpEnabled"`
 	ScopesRequired []string `yaml:"scopesRequired"`
@@ -55,7 +56,7 @@ func (cfg Config) IsMCPEnabled() bool {
 // Initialize a Google auth service
 func (cfg Config) Initialize() (auth.AuthService, error) {
 	if cfg.McpEnabled {
-		if cfg.Audience == "" && cfg.ClientID == "" {
+		if cfg.Audience == "" && cfg.ClientID == "" && len(cfg.ClientIDs) == 0 {
 			return nil, fmt.Errorf("`audience` or `clientId` is required when `mcpEnabled` is true")
 		}
 	} else {
@@ -120,16 +121,43 @@ func (a AuthService) GetAuthorizationServer() string {
 	return "https://accounts.google.com"
 }
 
-// Verifies Google ID token and return claims
+// Verifies Google ID token or access token and returns claims
 func (a AuthService) GetClaimsFromHeader(ctx context.Context, h http.Header) (map[string]any, error) {
-	if token := h.Get(a.Name + "_token"); token != "" {
-		payload, err := idtoken.Validate(ctx, token, a.ClientID)
-		if err != nil {
-			return nil, fmt.Errorf("google ID token verification failure: %w", err)
-		}
-		return payload.Claims, nil
+	token := h.Get(a.Name + "_token")
+	if token == "" {
+		return nil, nil
 	}
-	return nil, nil
+
+	token = strings.TrimSpace(token)
+	if strings.HasPrefix(strings.ToLower(token), "bearer ") {
+		token = strings.TrimSpace(token[7:])
+	}
+
+	if isJWTFormat(token) {
+		aud := a.Audience
+		if aud == "" {
+			aud = a.ClientID
+		}
+		payload, err := idtoken.Validate(ctx, token, aud)
+		if err == nil {
+			return payload.Claims, nil
+		}
+		for _, cid := range a.ClientIDs {
+			if cid != "" && cid != aud {
+				if p, e := idtoken.Validate(ctx, token, cid); e == nil {
+					return p.Claims, nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("google ID token verification failure: %w", err)
+	}
+
+	// Validate opaque Google access token via tokeninfo
+	claims, err := a.validateAccessToken(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("google access token verification failure: %w", err)
+	}
+	return claims, nil
 }
 
 // ValidateMCPAuth handles MCP auth token validation for Google
@@ -151,12 +179,24 @@ func (a AuthService) ValidateMCPAuth(ctx context.Context, h http.Header) (map[st
 		if aud == "" {
 			aud = a.ClientID
 		}
-		if aud == "" {
+		if aud == "" && len(a.ClientIDs) == 0 {
 			return nil, &auth.MCPAuthError{Code: http.StatusUnauthorized, Message: "audience or client ID is required for ID token validation", ScopesRequired: a.ScopesRequired}
 		}
 		payload, err := idtoken.Validate(ctx, tokenStr, aud)
 		if err != nil {
-			return nil, &auth.MCPAuthError{Code: http.StatusUnauthorized, Message: fmt.Sprintf("Google ID token verification failure: %v", err), ScopesRequired: a.ScopesRequired}
+			matched := false
+			for _, cid := range a.ClientIDs {
+				if cid != "" && cid != aud {
+					if p, e := idtoken.Validate(ctx, tokenStr, cid); e == nil {
+						payload = p
+						matched = true
+						break
+					}
+				}
+			}
+			if !matched {
+				return nil, &auth.MCPAuthError{Code: http.StatusUnauthorized, Message: fmt.Sprintf("Google ID token verification failure: %v", err), ScopesRequired: a.ScopesRequired}
+			}
 		}
 
 		scopeClaim, _ := payload.Claims["scope"].(string)
@@ -177,6 +217,20 @@ func (a AuthService) ValidateMCPAuth(ctx context.Context, h http.Header) (map[st
 	}
 
 	// Validate opaque Google access token via tokeninfo
+	claims, err := a.validateAccessToken(ctx, tokenStr)
+	if err != nil {
+		if strings.Contains(err.Error(), "insufficient scopes") {
+			return nil, &auth.MCPAuthError{Code: http.StatusForbidden, Message: "insufficient scopes", ScopesRequired: a.ScopesRequired}
+		}
+		if strings.Contains(err.Error(), "failed to call Google tokeninfo") {
+			return nil, &auth.MCPAuthError{Code: http.StatusInternalServerError, Message: err.Error(), ScopesRequired: a.ScopesRequired}
+		}
+		return nil, &auth.MCPAuthError{Code: http.StatusUnauthorized, Message: err.Error(), ScopesRequired: a.ScopesRequired}
+	}
+	return claims, nil
+}
+
+func (a AuthService) validateAccessToken(ctx context.Context, tokenStr string) (map[string]any, error) {
 	data := url.Values{}
 	data.Set("access_token", tokenStr)
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://oauth2.googleapis.com/tokeninfo", strings.NewReader(data.Encode()))
@@ -192,12 +246,12 @@ func (a AuthService) ValidateMCPAuth(ctx context.Context, h http.Header) (map[st
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, &auth.MCPAuthError{Code: http.StatusInternalServerError, Message: fmt.Sprintf("failed to call Google tokeninfo: %v", err), ScopesRequired: a.ScopesRequired}
+		return nil, fmt.Errorf("failed to call Google tokeninfo: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, &auth.MCPAuthError{Code: http.StatusUnauthorized, Message: fmt.Sprintf("Google token validation failed with status: %d", resp.StatusCode), ScopesRequired: a.ScopesRequired}
+		return nil, fmt.Errorf("Google token validation failed with status: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -205,31 +259,18 @@ func (a AuthService) ValidateMCPAuth(ctx context.Context, h http.Header) (map[st
 		return nil, fmt.Errorf("failed to read Google tokeninfo response: %w", err)
 	}
 
-	var tokenInfo struct {
-		Aud   string `json:"aud"`
-		Azp   string `json:"azp"`
-		Scope string `json:"scope"`
-	}
-	if err := json.Unmarshal(body, &tokenInfo); err != nil {
+	var claims map[string]any
+	if err := json.Unmarshal(body, &claims); err != nil {
 		return nil, fmt.Errorf("failed to decode Google tokeninfo response: %w", err)
 	}
 
-	aud := tokenInfo.Aud
-	if aud == "" {
-		aud = tokenInfo.Azp
-	}
-
-	audLimit := a.Audience
-	if audLimit == "" {
-		audLimit = a.ClientID
-	}
-
-	if audLimit != "" && aud != audLimit {
-		return nil, &auth.MCPAuthError{Code: http.StatusUnauthorized, Message: "audience validation failed", ScopesRequired: a.ScopesRequired}
+	if !a.isAllowedAudience(claims) {
+		return nil, fmt.Errorf("audience validation failed")
 	}
 
 	if len(a.ScopesRequired) > 0 {
-		tokenScopes := strings.Fields(tokenInfo.Scope)
+		scopeClaim, _ := claims["scope"].(string)
+		tokenScopes := strings.Fields(scopeClaim)
 		scopeMap := make(map[string]bool)
 		for _, s := range tokenScopes {
 			scopeMap[s] = true
@@ -237,16 +278,72 @@ func (a AuthService) ValidateMCPAuth(ctx context.Context, h http.Header) (map[st
 
 		for _, requiredScope := range a.ScopesRequired {
 			if !scopeMap[requiredScope] {
-				return nil, &auth.MCPAuthError{Code: http.StatusForbidden, Message: "insufficient scopes", ScopesRequired: a.ScopesRequired}
+				return nil, fmt.Errorf("insufficient scopes")
 			}
 		}
 	}
 
-	claims := map[string]any{
-		"aud":   aud,
-		"scope": tokenInfo.Scope,
-	}
 	return claims, nil
+}
+
+func (a AuthService) isAllowedAudience(claims map[string]any) bool {
+	audLimit := a.Audience
+	if audLimit == "" {
+		audLimit = a.ClientID
+	}
+
+	allowed := make(map[string]bool)
+	if audLimit != "" {
+		allowed[audLimit] = true
+	}
+	for _, cid := range a.ClientIDs {
+		if cid != "" {
+			allowed[cid] = true
+		}
+	}
+
+	if len(allowed) == 0 {
+		return true
+	}
+
+	var candidateTokens []string
+	for _, key := range []string{"aud", "azp", "audience", "issued_to"} {
+		if val, ok := claims[key].(string); ok && val != "" {
+			candidateTokens = append(candidateTokens, val)
+		}
+	}
+
+	// Exact match
+	for _, tokenVal := range candidateTokens {
+		if allowed[tokenVal] {
+			return true
+		}
+	}
+
+	// Project number match (e.g. 786365316782-...)
+	for allowedVal := range allowed {
+		if allowedParts := strings.SplitN(allowedVal, "-", 2); len(allowedParts) == 2 && isNumeric(allowedParts[0]) {
+			for _, tokenVal := range candidateTokens {
+				if tokenParts := strings.SplitN(tokenVal, "-", 2); len(tokenParts) == 2 && isNumeric(tokenParts[0]) && tokenParts[0] == allowedParts[0] {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func isNumeric(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func isJWTFormat(token string) bool {
